@@ -1,0 +1,4 @@
+執行方式：
+	$ make
+	$ ./xxx.exe [threadNum] [Remainder Section size / Non-critical Section Size]
+

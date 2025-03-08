@@ -1,0 +1,92 @@
+type qnode = record
+      class : (reading, writing)
+      next : ^qnode
+      state : record
+          blocked : Boolean    // need to spin 
+          successor_class : (none, reader, writer)
+  type lock = record
+      tail : ^qnode := nil
+      reader_count : integer := 0
+      next_writer : ^qnode := nil
+  
+  // I points to a qnode record allocated 
+  // (in an enclosing scope) in shared memory 
+  // locally-accessible to the invoking processor
+  
+  procedure start_write (L : ^lock; I : ^qnode)
+      with I^, L^
+          class := writing; next := nil
+          state := [true, none]
+          pred : ^qnode := fetch_and_store (&tail, I)
+          if pred = nil
+              next_writer := I
+              if reader_count = 0 and fetch_and_store (&next_writer,nil) = I
+                  // no reader who will resume me 
+                  blocked := false
+          else
+              // must update successor_class before updating next 
+              pred->successor_class := writer 
+              pred->next := I
+          repeat while blocked
+  
+  procedure end_write (L: ^lock; I : ^qnode)
+      with I^, L^
+          if next != nil or not compare_and_store (&tail, I, nil)
+              // wait until succ inspects my state 
+              repeat while next = nil   
+              if next->class = reading
+                  atomic_increment (&reader_count)
+              next->blocked := false
+  
+  procedure start_read (L : ^lock; I : ^qnode)
+      with I^, L^
+          class := reading; next := nil 
+          state := [true, none]
+          pred : ^qnode := fetch_and_store (&tail, I)
+
+          /* 第一個人 */
+          if pred = nil
+              atomic_increment (&reader_count)
+              blocked := false  // for successor
+          
+          /* 等待前一個人釋放鎖 */
+          else
+              
+              /* 前一個人是 writer 或是 waiting reader */
+              if pred->class = writing or compare_and_store (&pred->state, 
+                         [true, none], [true, reader])
+                  // pred is a writer, or a waiting reader
+                  // pred will increment reader_count and release me
+                  pred->next := I
+                  repeat while blocked
+              
+              /* 前一個人是 reader */
+              else
+                  // increment reader_count and go
+                  atomic_increment (&reader_count)
+                  pred->next := I
+                  blocked := false
+
+          /* 在執行 53～66 行時又有 reader 加到 waiting queue 所以一起把新的 reader 拉進來 */
+          if successor_class = reader
+              repeat while next = nil
+              atomic_increment (&reader_count)
+              next->blocked := false
+  
+  procedure end_read (L : ^lock; I : ^qnode)
+      with I^, L^
+          
+          /* reader 一個接一個出去，如果到最後一個 reader 的下一個人是 writer，假設為 A 則紀錄 next_writer = A */
+          if next != nil or not compare_and_store (&tail, I, nil)
+              // wait until successor inspects my state 
+              repeat while next = nil     
+              if successor_class = writer
+                  next_writer := next
+          
+          if fetch_and_decrement (&reader_count) = 1
+                  and (w := next_writer) != nil
+                  and reader_count = 0
+                  and compare_and_store (&next_writer, w, nil)
+              // I'm the last active reader and there exists a waiting
+              // writer and no readers *after* identifying the writer
+              w->blocked := false
