@@ -39,70 +39,15 @@ public:
     ~ORONLock() { delete optlock; }
 
     uint64_t lock(int order) {
-        uint64_t versioncurr, versionlock;
-        atomic_store_explicit(&(optlock->wait_ary[order]), 1, std::memory_order_release);
-        while (1) {
-            while (optlock->wait_ary[order] != 0 && ORONLock::has_locked_bit(&optlock->version)) {
-                asm("pause");
-            }
-            versioncurr = atomic_load_explicit(&optlock->version, std::memory_order_acquire);
-            if (!ORONLock::has_locked_bit(versioncurr)) {
-                versionlock = ORONLock::make_locked_version(versioncurr);
-                if (atomic_compare_exchange_weak_explicit(&(optlock->version), &versioncurr, versionlock, std::memory_order_relaxed, std::memory_order_relaxed)) {
-                    optlock->wait_ary[order] = 0;
-                    atomic_thread_fence(std::memory_order_release); // 避免使用者 lock() 完馬上呼叫 unlock()
-                    return versioncurr;
-                }
-                continue;
-            }
-            if (atomic_load_explicit(&(optlock->wait_ary[order]), std::memory_order_acquire) == 0) {
-                //printf("lock: %d\n", order);
-                return versioncurr - kLockedBit;
-            }
-        }
     }
 
     void unlock(int order) {
-        for (int i = 1; i < Num_core; i++) {
-            __builtin_prefetch((int*)&optlock->wait_ary[(order+i+2)%Num_core], 0, 0);
-            if ((optlock->wait_ary[(order+i)%Num_core] == 1)) {
-                atomic_store_explicit(&(optlock->wait_ary[(order+i)%Num_core]), 0, std::memory_order_relaxed);
-                //printf("lock: %d\n", order);
-                return;
-            }
-        }
-        optlock->version.fetch_add(kNextUnlockedVersion);
-        return;
     }
 
     bool try_lock(uint64_t version, int order) {
-        if (!validate_read(version)) {
-            return false;
-        }
-        
-        atomic_store_explicit(&(optlock->wait_ary[order]), 1, std::memory_order_release);
-        
-        uint64_t versioncurr = version;
-        uint64_t versionlock = ORONLock::make_locked_version(versioncurr);
-        for (int i=0; i<100; i++) {
-            if (!ORONLock::has_locked_bit(versioncurr)) {
-                optlock->wait_ary[order] = 0;
-                atomic_thread_fence(std::memory_order_release);
-                return atomic_compare_exchange_weak_explicit(&(optlock->version), &versioncurr, versionlock, std::memory_order_relaxed, std::memory_order_relaxed);
-            }
-            if (atomic_load_explicit(&(optlock->wait_ary[order]), std::memory_order_acquire) == 0) {
-                return 1;
-            }
-        }
-        int one = 1;
-        return !atomic_compare_exchange_weak_explicit(&(optlock->wait_ary[order]), &one, 0, std::memory_order_release, std::memory_order_acquire);
     }
 
     uint64_t try_begin_read(bool &restart) const {
-        uint64_t version = atomic_load_explicit(&optlock->version, std::memory_order_acquire);
-        restart = ORONLock::has_locked_bit(version);
-        // If [restart] hasn't been changed to false, [version] is guaranteed to be a version.
-        return version;
     }
 
     bool validate_read(uint64_t version) const { //（免改
