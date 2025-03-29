@@ -12,12 +12,6 @@ void routing2idCov() {
 }
 
 void rwlock_init(rwlock_t *rw_lock) {
-    rw_lock->w_owner = -1;
-    rw_lock->rthread_in_cs_count = 0;
-    for (int i = 0; i < Num_Core; i++) {
-        rw_lock->rwArray[i].w_state = 0;
-        rw_lock->rwArray[i].r_state = 0;
-    }
 }
 
 /*
@@ -27,71 +21,6 @@ void rwlock_init(rwlock_t *rw_lock) {
         2.「等待」，等 CS 中目前正持有 global lock 的 writer 按照順序輪到自己被准許自己進入 CS 中
 */
 void rwlock_wrlock(rwlock_t *rw_lock) {
-    
-    // 將 w_state = wthread_apply 是為了讓其他人曉得 writer 想要進入 CS 
-    atomic_store_explicit(&(rw_lock->rwArray[order].w_state), wthread_apply, memory_order_release);
-    
-    int flag = -1;
-    while (1) {
-
-        // 若（w_state == wthread_apply）&&（w_owner ！= no_wthread_in_cs）則 pause;
-        // 代表（當下 writer 想進入 CS）且（有人在 CS）則 writer 等待
-        while ((atomic_load_explicit(&(rw_lock->rwArray[order].w_state),memory_order_acquire) == wthread_apply) && (atomic_load_explicit(&(rw_lock->w_owner), memory_order_acquire) != no_wthread_in_cs))
-            asm("pause");
-
-        //「等待」，等待正在 CS 中的 writer 准許自己進入 CS 中
-        if (atomic_load_explicit(&(rw_lock->rwArray[order].w_state), memory_order_acquire) == wthread_approve) {
-            
-            // 計算要等的 reader 數量
-            // example (1)->2->3->(4) 1, 4 為 writer，2, 3 為 reader，1 現在持有鎖 rw_lock->w_owner＝1, order=4, count = 4 - 1 = 3
-            // example (3)->0->1->(2) 3, 2 為 writer，0, 1 為 reader，3 現在持有鎖 rw_lock->w_owner＝3, order=2, count = cpu數量（4）- 3 + 2 = 3
-            int last = rw_lock->w_owner;
-            int count = 0;
-            if (order > last)
-                count = order - last;
-            else 
-                count = Num_Core - last + order;
-            
-            // 等待 CS 中的 reader 離開 CS
-            for (int j=1; j<count; j++) {
-        		while ((atomic_load_explicit(&(rw_lock->rwArray[(last+j) % Num_Core].r_state), memory_order_acquire) == rthread_approve)) {
-        	       	asm("pause");
-        		}         
-       	    }
-
-            // 將 w_owner = 自己的 order，代表 "order" 進入 CS
-            atomic_store_explicit(&(rw_lock->w_owner), order, memory_order_release); 
-            return;
-        }
-
-        flag = -1;
-
-        //「爭奪」，plock，預先判斷若 w_owner == no_wthread_in_cs 代表沒有 writer 在 CS 中，所以 writer 可以進行 global lock（w_owner）爭奪
-        if (__glibc_unlikely(rw_lock->w_owner == no_wthread_in_cs)) {
-
-            // 爭奪 gloalb lock（w_owner），一次只會有一個 writer 搶到，並在等待 reader 離開 CS 後把 w_owner 設為搶到者的 TSP_ID
-            if (atomic_compare_exchange_weak_explicit(&(rw_lock->w_owner), &flag, order, memory_order_release, memory_order_acquire)) {
-                
-                // 等待先前拿到 global lock 的 reader 更改 r_state，如何確保 r_state 更改？
-                // 方法：當 rthread_in_cs_count 為零，則能確保進入 CS 的 reader 已經更改 r_state
-                while ((atomic_load_explicit(&(rw_lock->rthread_in_cs_count), memory_order_acquire)) != 0) {
-                    asm("pause");
-                }
-
-                // 等待 CS 中的 reader 離開 CS
-                for (int i = 1; i < Num_Core; i++) {
-        			while ((atomic_load_explicit(&(rw_lock->rwArray[(order+i) % Num_Core].r_state), memory_order_acquire) == rthread_approve)) {
-         		    	asm("pause");
-        		    }         
-       			}
-
-                // 將 w_state 改為 wthread_approve 是為了避免，讓其他人誤會自己想要進入 CS 中，因為此時自己已在 CS 中
-                atomic_store_explicit( &(rw_lock->rwArray[order].w_state), wthread_approve, memory_order_release);
-                return;
-            }
-        }
-    }
-    return;
 }
 
 /*
@@ -101,95 +30,12 @@ void rwlock_wrlock(rwlock_t *rw_lock) {
         2.「等待」，等待 CS 中目前正持有 global lock 的 writer 按照順序輪到自己被准許自己進入 CS 中
 */
 void rwlock_rdlock(rwlock_t *rw_lock) {
-    
-    // 將 r_state = rthread_apply 代表讓其他人曉得 reader 想要進入 CS
-    atomic_store_explicit(&(rw_lock->rwArray[order].r_state), rthread_apply, memory_order_release);
-   
-    int flag = -1;
-    while (1) {
-        
-        // 若（r_state == rthread_apply）&&（r_owner ！= no_wthread_in_cs）pause;
-        // 代表（當下 reader 想進入 CS）且（有人在 CS）則 reader 等待
-        while ((atomic_load_explicit(&(rw_lock->rwArray[order].r_state),memory_order_acquire) == rthread_apply) && (atomic_load_explicit(&(rw_lock->w_owner), memory_order_acquire) != no_wthread_in_cs))        
-            asm("pause");
-        
-        //「等待」，等待正在 CS 中的 writer 准許自己進入 CS 中
-        if (atomic_load_explicit(&(rw_lock->rwArray[order].r_state), memory_order_acquire) ==rthread_approve) {
-        	return ;
-        }
-
-        flag = -1;
-        
-        //「判斷」，預先判斷 global lock 是否正被 writer 持有，若無則可直接進入 CS 中
-        if (__glibc_unlikely(rw_lock->w_owner == no_wthread_in_cs)) {
-
-            // 拿到鎖之前「先告知」多一人：可能有 reader 會進入 CS 中，因為 reader 可能拿鎖失敗！
-            atomic_fetch_add_explicit(&rw_lock->rthread_in_cs_count, 1, memory_order_relaxed);
-            
-            // if (atomic_compare_exchange_weak_explicit(&(rw_lock->w_owner), &flag, -1, memory_order_release,memory_order_acquire))
-
-            // 再次確認 w_owner == no_wthread_in_cs，用來確保真的沒有 writer 在 CS 中
-            if (atomic_load_explicit(&(rw_lock->w_owner), memory_order_acquire) == no_wthread_in_cs) {
-                
-                // 將 r_state 改為 rthread_approve 是為了避免，讓其他人誤會自己想要進入 CS 中，因為此時自己已在 CS 中
-                atomic_store_explicit( &(rw_lock->rwArray[order].r_state), rthread_approve, memory_order_release);
-                
-                // printf("-1 %d\n ",order);
-
-                // 拿到鎖之後，把剛剛的「先告知」的多一人 rthread_in_cs_count 的值回復
-                atomic_fetch_add_explicit(&rw_lock->rthread_in_cs_count, -1, memory_order_relaxed); // +（-1）
-                return;
-            }
-
-            // 拿鎖失敗後，把剛剛的「先告知」的多一人 rthread_in_cs_count 的值回復
-            atomic_fetch_add_explicit(&rw_lock->rthread_in_cs_count, -1, memory_order_relaxed); // +（-1）
-        }
-    }
-    return;
 }
 
 /*
     reader & writer unlock
 */
 void rwlock_unlock(rwlock_t *rw_lock) {
-
-    // reader unlock
-    // 當 reader 在 CS 中時 r_state 的值必為 rthread_approve，如此能判斷為哪一種 thread
-    if (rw_lock->rwArray[order].r_state == rthread_approve) {
-
-        // 更改 r_state 使之離開 CS
-        atomic_store_explicit(&(rw_lock->rwArray[order].r_state), rthread_leave, memory_order_release);
-        return;
-    }
-
-    // writer unlock
-    // 依照 TSP order 尋找想要進入 CS 的 thread
-    int one = 1, next;
-    for (int i = 1; i < Num_Core; i++) {
-        one = 1;
-        next = (order+i) % Num_Core;
-        // 例：TSP order = A(w) -> B(r) -> C(r) -> D(r) -> E(w)
-        // 1. 現 CS 中為 A 且 TSP order 中下一個想進入的 writer 為 E
-        // 2. 則 A 透過 TSP order 嘗試尋找下一個 wthread_apply 之 writer（e.g. E）
-        // 3. 第二條 if 成立：尋找的途中找到 B, C, D 之 r_state == rthread_apply，故 A 將 B, C, D 之 r_state = rthread_approve，所以 B, C, D 被 A 准許進入 CS 中
-        // 4. 第一條 if 成立：而後找到 E 之 w_state == wthread_apply，故 A 將 E 之 w_state = wthread_approve，所以 E 被 A 准許進入 CS 中
-
-        // 對應 writer lock，33 行（if (atomic_load_explicit(&(rw_lock->rwArray[order].w_state), memory_order_acquire) == wthread_approve)）
-        // 照順序找到想進入 CS 的 writer 後准許其進入 CS 中
-        if ((atomic_load_explicit(&(rw_lock->rwArray[next].w_state), memory_order_acquire) == wthread_apply)) {
-            atomic_store_explicit(&(rw_lock->rwArray[next].w_state), wthread_approve, memory_order_release);
-            return;
-        }
-
-        // 對應 reader lock，109 行（if (atomic_load_explicit(&(rw_lock->rwArray[order].r_state), memory_order_acquire) == rthread_approve)）
-        // 讓照順序找到下一個 writer 之前的 reader 進入 CS 中
-        if (atomic_compare_exchange_weak_explicit(&(rw_lock->rwArray[next].r_state), &one, rthread_approve,memory_order_release,memory_order_acquire)) {
-        }
-    }
-
-    // 沒有找到任何 writer 想要進入 CS 中，則打開 global lock，將 w_owner = no_wthread_in_cs
-    atomic_store_explicit(&(rw_lock->w_owner), no_wthread_in_cs, memory_order_release);
-    return;
 }
 
 rwlock_t rw;
